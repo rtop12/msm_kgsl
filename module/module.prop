@@ -1,0 +1,6 @@
+id=msm_kgsl_r8
+name=Adreno KGSL r8 (gfx-kernel lnx.16.0.r8)
+version=@DATE@ (@VERMAGIC@)
+versionCode=20260101
+author=rtop12
+description=CAF graphics-kernel lnx.16.0.r8-rel 编出的 msm_kgsl.ko，覆盖 /vendor/lib/modules/msm_kgsl.ko。vermagic: @VERMAGIC@  只适用于同 vermagic 的自编内核(HyperOS/官方内核会拒载)。
