@@ -84,9 +84,18 @@ bash tools/pack_module.sh path/to/msm_kgsl.ko out.zip [vermagic]
 - 树默认版本：`6.1.176-android14-11-ab14529422`，85 个 .c 全过，ko 32 MB / strip 3.2 MB，模块 zip 1.6 MB
 - 指定 `kernel_version=6.1.138-android14-11-g0c3d559bcd85-ab14529422`：产物 vermagic 完全一致
 
-修过的坑：`governor.h` 找不到（Kbuild 的 `-I$(KERNEL_SRC)/drivers/devfreq` 在树内 `M=` 时为空，回落 `$(srctree)`）、`CONFIG_QCOM_KGSL` 被 `olddefconfig` 删掉（`kd/drivers/Kconfig` 加 `source "msm_kgsl/Kconfig"`）、树里写死的 `BUILD_NUMBER`。
 
 ## 注意
 
 - 官方内核开了 `CONFIG_MODVERSIONS` + 模块签名，这种自编 ko **只能配自编内核**（关掉签名/用同一棵树全量编译）。
 - 想彻底对上内核，把 `kernel_repo`/`kernel_ref` 换成你自编内核的仓库和分支，再用 `kernel_version` 兜底版本号。
+
+## 踩过的坑（都已在 workflow 里修好）
+
+1. `governor.h` 找不到 —— Kbuild 里 `-I$(KERNEL_SRC)/drivers/devfreq`，树内 `M=` 编译时这个变量是空的，改成回落 `$(srctree)`。
+2. `CONFIG_QCOM_KGSL` 被 `olddefconfig` 删掉 —— 内核树没有这个符号，把源码放 `kd/msm_kgsl/` 并在 `kd/drivers/Kconfig` 加 `source "msm_kgsl/Kconfig"`。
+3. 这棵树写死了 `export BUILD_NUMBER = 14529422`，`setlocalversion` 会额外追加 `-ab14529422`，vermagic 变成两截。
+4. **vermagic 尾巴多一个 `+`**（CI 上必现）：`git clone` 出来的仓库不在 tag 上，`setlocalversion` 的 `scm_version --short` 返回 `+`，
+   而它的判断条件是「`LOCALVERSION` 环境变量是否已定义」。本地用 tarball 编不会出现，所以容易漏。
+   修法：全程给 make 一个**空的** `LOCALVERSION`（已定义 → 不加 `+`），workflow 里 job env 和 `$GITHUB_ENV` 都设了。
+   另外 `modules_prepare` 之后会先读 `out/include/config/kernel.release` 和目标比对，**不对就立刻失败**，不用等 20 分钟编译完才发现。
