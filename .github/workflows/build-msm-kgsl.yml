@@ -1,0 +1,124 @@
+name: build-msm-kgsl-ko
+
+# 把 CAF graphics-kernel (lnx.16.0.r8) 当外部模块编成 msm_kgsl.ko
+# 用法: Actions -> build-msm-kgsl-ko -> Run workflow (默认参数就能出 ko)
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "内核树仓库 (owner/repo，需带 arch/arm64/configs/vendor/*)"
+        required: true
+        default: "cnmrlin/android_kernel_xiaomi_sm8650"
+      kernel_ref:
+        description: "分支或 tag"
+        required: true
+        default: "lineage-24.0"
+      vendor_config:
+        description: "配置片段 (arch/arm64/configs/vendor/ 下的文件名)"
+        required: true
+        default: "pineapple_GKI.config"
+      jobs:
+        description: "并行任务数"
+        required: true
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      KREPO: ${{ inputs.kernel_repo }}
+      KREF: ${{ inputs.kernel_ref }}
+      VCONF: ${{ inputs.vendor_config }}
+      JOBS: ${{ inputs.jobs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 清理磁盘
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential clang lld llvm make bc bison flex libssl-dev libelf-dev \
+            python3 python-is-python3 kmod cpio rsync zip unzip zstd dwarves
+          clang --version | head -1
+          nproc; free -g | head -2
+
+      - name: 拉内核树
+        run: |
+          git clone --depth 1 -b "$KREF" "https://github.com/$KREPO.git" kd
+          du -sh kd
+          test -f "kd/arch/arm64/configs/vendor/$VCONF" || {
+            echo "::error::内核树里没有 arch/arm64/configs/vendor/$VCONF，下面是可选的："
+            ls kd/arch/arm64/configs/vendor | head -80
+            exit 1
+          }
+
+      - name: 放入 KGSL 源码并挂上 Kconfig
+        run: |
+          rm -rf kd/msm_kgsl && mkdir -p kd/msm_kgsl
+          rsync -a --exclude='.git*' src/ kd/msm_kgsl/
+          # KERNEL_SRC 在"树内 M=" 编译时为空，改走 srctree 找 drivers/devfreq/governor.h
+          sed -i 's|-I$(KERNEL_SRC)/drivers/devfreq|-I$(if $(KERNEL_SRC),$(KERNEL_SRC),$(srctree))/drivers/devfreq|' \
+            kd/msm_kgsl/Kbuild
+          grep -q 'msm_kgsl/Kconfig' kd/drivers/Kconfig || \
+            printf '\n# KGSL (Adreno)\nsource "msm_kgsl/Kconfig"\n' >> kd/drivers/Kconfig
+
+      - name: 配置内核 (gki + 机型片段)
+        run: |
+          cd kd
+          mkdir -p out
+          make O=out ARCH=arm64 LLVM=1 gki_defconfig
+          scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/vendor/"$VCONF"
+          scripts/config --file out/.config \
+            -e MODULES -e MODVERSIONS -e MODULE_UNLOAD \
+            -e QCOM_KGSL -e QCOM_KGSL_POOL -e QCOM_KGSL_CONTEXT_DEBUG \
+            -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL \
+            -e DEBUG_INFO_NONE -d DEBUG_INFO_BTF -d DEBUG_INFO_DWARF5 \
+            -e WERROR \
+            -d MODULE_SIG_ALL -d MODULE_SIG_FORCE -d MODULE_SIG_PROTECT
+          make O=out ARCH=arm64 LLVM=1 olddefconfig
+          grep -E '^CONFIG_(QCOM_KGSL|MODULES|MODVERSIONS|ARM_SMMU|COMPAT|SYNC_FILE|CORESIGHT|LTO)=' out/.config
+
+      - name: modules_prepare
+        run: |
+          cd kd
+          make O=out ARCH=arm64 LLVM=1 -j"$JOBS" modules_prepare
+
+      - name: 编译 msm_kgsl.ko
+        continue-on-error: true
+        run: |
+          cd kd
+          make O=out ARCH=arm64 LLVM=1 -j"$JOBS" M="$PWD/msm_kgsl" KERNEL_SRC="$PWD" modules \
+            2>&1 | tee ../build.log
+
+      - name: 收集产物
+        if: always()
+        run: |
+          mkdir -p artifact
+          cp -v kd/msm_kgsl/msm_kgsl.ko artifact/ 2>/dev/null || true
+          cp -v build.log artifact/ 2>/dev/null || true
+          cp -v kd/out/.config artifact/kernel.config 2>/dev/null || true
+          if [ -f artifact/msm_kgsl.ko ]; then
+            llvm-strip --strip-debug -o artifact/msm_kgsl.stripped.ko artifact/msm_kgsl.ko || true
+            modinfo artifact/msm_kgsl.ko > artifact/msm_kgsl.modinfo.txt 2>&1 || true
+          fi
+          ls -l artifact
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: msm_kgsl-ko
+          path: artifact/
+          if-no-files-found: warn
+          retention-days: 14
