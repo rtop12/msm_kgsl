@@ -26,3 +26,8 @@ make O=out ARCH=arm64 LLVM=1 olddefconfig
 make O=out ARCH=arm64 LLVM=1 -j"$JOBS" modules_prepare
 make O=out ARCH=arm64 LLVM=1 -j"$JOBS" M="$KD/msm_kgsl" KERNEL_SRC="$KD" modules
 ls -l "$KD/msm_kgsl/msm_kgsl.ko"
+
+# 顺手打个可刷入模块 zip（Magisk / KernelSU）
+if command -v zip >/dev/null 2>&1 && [ -f "$HERE/tools/pack_module.sh" ]; then
+  bash "$HERE/tools/pack_module.sh" "$KD/msm_kgsl/msm_kgsl.ko" "$KD/msm_kgsl-r8-module.zip" || true
+fi
