@@ -44,6 +44,7 @@ jobs:
       VCONF: ${{ inputs.vendor_config }}
       JOBS: ${{ inputs.jobs }}
       KVER_IN: ${{ inputs.kernel_version }}
+      LOCALVERSION: ""            # 空但已定义：阻止 setlocalversion 追加 "+"
     steps:
       - uses: actions/checkout@v4
 
@@ -108,8 +109,11 @@ jobs:
           sed -i "s/^export BUILD_NUMBER = .*/export BUILD_NUMBER =/" kd/Makefile
           grep -n "BUILD_NUMBER" kd/Makefile | head -2
           head -6 kd/Makefile
+          # 双保险：空的 .scmversion 让 scm_version() 直接返回空，彻底避免 git 带来的 "+"/-g<sha>
+          : > kd/.scmversion
 
           {
+            echo "LOCALVERSION="          # 关键：让 setlocalversion 不再追 "+"（git 仓库非 tagged 提交时会加）
             echo "LOCALVERSION_KERNEL=$LOCAL"
             echo "VERSION_KERNEL_SPEC=$KVER_IN"
           } >> "$GITHUB_ENV"
@@ -152,6 +156,15 @@ jobs:
         run: |
           cd kd
           make O=out ARCH=arm64 LLVM=1 -j"$JOBS" modules_prepare
+          echo "kernelrelease: $(cat out/include/config/kernel.release 2>/dev/null)"
+          if [ -n "${VERSION_KERNEL_SPEC:-}" ]; then
+            GOT=$(cat out/include/config/kernel.release 2>/dev/null || true)
+            if [ "$GOT" != "$VERSION_KERNEL_SPEC" ]; then
+              echo "::error::内核版本号不对：$GOT，期望 $VERSION_KERNEL_SPEC（常见原因：setlocalversion 又加了 + 或 -g<sha>）"
+              exit 1
+            fi
+            echo "kernelrelease 与目标一致 ✓"
+          fi
 
       - name: 编译 msm_kgsl.ko
         continue-on-error: true
