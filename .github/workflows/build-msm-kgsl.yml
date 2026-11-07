@@ -1,10 +1,19 @@
 name: build-msm-kgsl-ko
 
-# 把 CAF graphics-kernel (lnx.16.0.r8) 当外部模块编成 msm_kgsl.ko
-# 用法: Actions -> build-msm-kgsl-ko -> Run workflow (默认参数就能出 ko)
+# 把 CAF graphics-kernel (lnx.16.0.r8) 当外部模块编成 msm_kgsl.ko，
+# 再打包成 Magisk / KernelSU 可直接刷入的模块 zip。
+#
+# 产物 vermagic（即"对应内核版本"）两种模式：
+#   - kernel_version 留空：用内核树自己的版本（6.1.176-android14-11 ...）
+#   - kernel_version 填了：把内核树的版本改成目标值再编，产物 vermagic 与之一致
+#     例：6.1.138-android14-11-g0c3d559bcd85-ab14529422
 on:
   workflow_dispatch:
     inputs:
+      kernel_version:
+        description: "产物 vermagic / 目标内核版本（留空=用内核树自身版本）"
+        required: false
+        default: ""
       kernel_repo:
         description: "内核树仓库 (owner/repo，需带 arch/arm64/configs/vendor/*)"
         required: true
@@ -34,6 +43,7 @@ jobs:
       KREF: ${{ inputs.kernel_ref }}
       VCONF: ${{ inputs.vendor_config }}
       JOBS: ${{ inputs.jobs }}
+      KVER_IN: ${{ inputs.kernel_version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +74,46 @@ jobs:
             exit 1
           }
 
+      - name: 设定产物内核版本
+        run: |
+          TREE_VER=$(awk '/^VERSION =/{v=$3} /^PATCHLEVEL =/{p=$3} /^SUBLEVEL =/{s=$3} /^EXTRAVERSION =/{e=$3} END{print v"."p"."s e}' kd/Makefile)
+          echo "内核树版本: ${TREE_VER:-未知}"
+          if [ -z "${KVER_IN}" ]; then
+            echo "未指定 kernel_version，沿用内核树自身版本" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # 拆成 主版本(6.1.138) 与 本地版本(-android14-11-gxxxx-abNNN)
+          BASE=${KVER_IN%%-*}
+          LOCAL=""
+          case "$KVER_IN" in
+            *-*) LOCAL="-${KVER_IN#*-}" ;;
+          esac
+          V=${BASE%%.*}
+          REST=${BASE#*.}
+          PL=${REST%%.*}
+          SL=${REST#*.}
+          case "$V$PL$SL" in
+            ''|*[!0-9]*) echo "::error::kernel_version 格式不对：$KVER_IN（应形如 6.1.138-android14-11-...）"; exit 1 ;;
+          esac
+          echo "目标 vermagic : $KVER_IN"
+          echo "  VERSION=$V PATCHLEVEL=$PL SUBLEVEL=$SL"
+          echo "  CONFIG_LOCALVERSION=$LOCAL"
+
+          sed -i "s/^VERSION = .*/VERSION = $V/; \
+                  s/^PATCHLEVEL = .*/PATCHLEVEL = $PL/; \
+                  s/^SUBLEVEL = .*/SUBLEVEL = $SL/; \
+                  s/^EXTRAVERSION = .*/EXTRAVERSION =/" kd/Makefile
+          # 这棵树里写死了 export BUILD_NUMBER = 14529422，会被 setlocalversion 追加成 -abNNN，清掉
+          sed -i "s/^export BUILD_NUMBER = .*/export BUILD_NUMBER =/" kd/Makefile
+          grep -n "BUILD_NUMBER" kd/Makefile | head -2
+          head -6 kd/Makefile
+
+          {
+            echo "LOCALVERSION_KERNEL=$LOCAL"
+            echo "VERSION_KERNEL_SPEC=$KVER_IN"
+          } >> "$GITHUB_ENV"
+
       - name: 放入 KGSL 源码并挂上 Kconfig
         run: |
           rm -rf kd/msm_kgsl && mkdir -p kd/msm_kgsl
@@ -87,8 +137,16 @@ jobs:
             -e DEBUG_INFO_NONE -d DEBUG_INFO_BTF -d DEBUG_INFO_DWARF5 \
             -e WERROR \
             -d MODULE_SIG_ALL -d MODULE_SIG_FORCE -d MODULE_SIG_PROTECT
+          if [ -n "${LOCALVERSION_KERNEL:-}" ]; then
+            # 直接写 .config，避免以 - 开头的值被当成命令行选项
+            sed -i '/^CONFIG_LOCALVERSION=/d; /^CONFIG_LOCALVERSION_AUTO=/d' out/.config
+            {
+              printf 'CONFIG_LOCALVERSION="%s"\n' "${LOCALVERSION_KERNEL}"
+              printf '# CONFIG_LOCALVERSION_AUTO is not set\n'
+            } >> out/.config
+          fi
           make O=out ARCH=arm64 LLVM=1 olddefconfig
-          grep -E '^CONFIG_(QCOM_KGSL|MODULES|MODVERSIONS|ARM_SMMU|COMPAT|SYNC_FILE|CORESIGHT|LTO)=' out/.config
+          grep -E '^CONFIG_(QCOM_KGSL|MODULES|MODVERSIONS|ARM_SMMU|COMPAT|SYNC_FILE|CORESIGHT|LTO|LOCALVERSION)' out/.config
 
       - name: modules_prepare
         run: |
@@ -102,7 +160,7 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 -j"$JOBS" M="$PWD/msm_kgsl" KERNEL_SRC="$PWD" modules \
             2>&1 | tee ../build.log
 
-      - name: 收集产物
+      - name: 收集产物 + strip
         if: always()
         run: |
           mkdir -p artifact
@@ -110,15 +168,52 @@ jobs:
           cp -v build.log artifact/ 2>/dev/null || true
           cp -v kd/out/.config artifact/kernel.config 2>/dev/null || true
           if [ -f artifact/msm_kgsl.ko ]; then
-            llvm-strip --strip-debug -o artifact/msm_kgsl.stripped.ko artifact/msm_kgsl.ko || true
+            llvm-strip --strip-debug -o artifact/msm_kgsl.stripped.ko artifact/msm_kgsl.ko || \
+              cp artifact/msm_kgsl.ko artifact/msm_kgsl.stripped.ko
+            modinfo -F vermagic artifact/msm_kgsl.ko | awk '{print $1}' > artifact/vermagic.txt || true
             modinfo artifact/msm_kgsl.ko > artifact/msm_kgsl.modinfo.txt 2>&1 || true
           fi
           ls -l artifact
+          if [ -f artifact/vermagic.txt ]; then
+            echo "产物 vermagic: $(cat artifact/vermagic.txt)"
+            echo "- 产物 vermagic: \`$(cat artifact/vermagic.txt)\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 校验 vermagic
+        if: always()
+        run: |
+          if [ -z "${VERSION_KERNEL_SPEC:-}" ]; then
+            echo "未指定 kernel_version，跳过 vermagic 校验"
+            exit 0
+          fi
+          if [ ! -f artifact/vermagic.txt ]; then
+            echo "::error::没有产物，无法校验"
+            exit 1
+          fi
+          GOT=$(cat artifact/vermagic.txt)
+          if [ "$GOT" = "$VERSION_KERNEL_SPEC" ]; then
+            echo "vermagic 与目标一致 ✓ ($GOT)"
+          else
+            echo "::error::vermagic 不一致：产物 $GOT，期望 $VERSION_KERNEL_SPEC"
+            exit 1
+          fi
+
+      - name: 打包成刷机模块 (Magisk / KernelSU)
+        if: always()
+        run: |
+          if [ -f artifact/msm_kgsl.stripped.ko ]; then
+            VERMAGIC=$(cat artifact/vermagic.txt)
+            bash tools/pack_module.sh artifact/msm_kgsl.stripped.ko \
+              "artifact/msm_kgsl-r8-module.zip" "$VERMAGIC"
+            unzip -l artifact/msm_kgsl-r8-module.zip
+          else
+            echo "::warning::没有编出 ko，跳过模块打包"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: msm_kgsl-ko
+          name: msm_kgsl-ko-${{ inputs.kernel_version || 'tree-default' }}
           path: artifact/
           if-no-files-found: warn
           retention-days: 14
